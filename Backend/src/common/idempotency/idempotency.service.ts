@@ -9,8 +9,9 @@ import { addSeconds } from '../util/time';
 
 export const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_.:-]{8,128}$/;
 
-/** Body fields that must not influence the fingerprint (secrets that the client may re-type). */
-const EXCLUDED_FIELDS = new Set(['pin']);
+/** Body fields that must not influence the fingerprint: secrets the client may re-type, and the
+ *  fraud step-up proof (challengeId + otp) that is added when retrying a CHALLENGEd request. */
+const EXCLUDED_FIELDS = new Set(['pin', 'otp', 'challengeId']);
 
 export interface BeginInput {
   scope: string;

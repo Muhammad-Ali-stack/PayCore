@@ -30,6 +30,12 @@ export const envSchema = z
 
     /** Hosted Redis (e.g. Redis Cloud). Must be rediss:// (TLS) in production. */
     REDIS_URL: z.string().url(),
+    /**
+     * `memory` runs without any Redis server (in-process ioredis-mock). Local development and demos
+     * only: single instance, counters reset on restart, requires QUEUE_DRIVER=inline. Forbidden in
+     * production.
+     */
+    REDIS_MODE: z.enum(['redis', 'memory']).default('redis'),
     BULLMQ_DRAIN_DELAY_SECONDS: int(30, 1, 600),
     BULLMQ_STALLED_INTERVAL_MS: int(60_000, 5_000),
     BULLMQ_WORKER_CONCURRENCY: int(2, 1, 50),
@@ -110,6 +116,50 @@ export const envSchema = z
     // ── Merchants ──
     MERCHANT_DEFAULT_MDR_BPS: int(150, 0, 1000),
     MERCHANT_DEFAULT_SETTLEMENT_DELAY_DAYS: int(1, 0, 30),
+
+    // ── Phase 3: cards ──
+    /** Master key (KEK) for card envelope encryption: base64 of exactly 32 random bytes. Required in production. */
+    CARD_MASTER_KEY: z
+      .union([z.string().refine(isBase64Key32, 'must be base64 of exactly 32 bytes'), z.literal('')])
+      .optional()
+      .transform((v) => (v ? v : undefined)),
+    /** Key id stored with every wrapped data key (rotation). */
+    CARD_MASTER_KEY_ID: z.string().regex(/^[A-Za-z0-9_-]{1,16}$/).default('mk1'),
+    /** Decrypt-only master keys during rotation: "kid:base64key,kid2:base64key2". */
+    CARD_PREVIOUS_MASTER_KEYS: z.string().optional(),
+    /** HMAC key for PAN fingerprints (lookup without decryption). Required (>= 32 chars) in production. */
+    CARD_FINGERPRINT_SECRET: z
+      .union([z.string().min(32, 'must be at least 32 characters'), z.literal('')])
+      .optional()
+      .transform((v) => (v ? v : undefined)),
+    /** 6-digit BIN of issued cards (4xxxxx = VISA, 51-55xxxx = MASTERCARD). */
+    CARD_BIN: z.string().regex(/^(4\d{5}|5[1-5]\d{4})$/, 'must be a 6-digit VISA (4...) or MASTERCARD (51-55...) BIN').default('422150'),
+    CARD_REVEAL_TTL_SECONDS: int(30, 5, 300),
+    CARD_REVEAL_MAX_PER_HOUR: int(10, 1, 100),
+    CARD_MAX_ACTIVE_VIRTUAL: int(5, 1, 50),
+    /** Uncaptured authorization holds are released after this long (stale-hold expiry job). */
+    CARD_HOLD_EXPIRY_HOURS: int(168, 1, 720),
+    /** Enables POST /v1/dev/cards/network (simulated card network). Rejected in production. */
+    CARD_SIM_ENABLED: bool(false),
+
+    // ── Phase 3: bills ──
+    BILLER_ADAPTER: z.enum(['simulated']).default('simulated'),
+    BILL_INQUIRY_TTL_SECONDS: int(600, 30, 86_400),
+    /** Biller submissions are retried with exponential backoff (base * 2^n) up to this many attempts. */
+    BILL_RETRY_MAX_ATTEMPTS: int(5, 1, 20),
+    BILL_RETRY_BASE_SECONDS: int(60, 1, 86_400),
+    /** Failed scheduled runs are retried within the cycle this many times before moving on. */
+    BILL_SCHEDULE_MAX_RETRIES: int(3, 0, 10),
+    /** UTC hour at which scheduled bill payments run on their day. */
+    BILL_SCHEDULE_RUN_HOUR_UTC: int(9, 0, 23),
+
+    // ── Phase 3: fraud, limits and controls ──
+    FRAUD_ENGINE_ENABLED: bool(true),
+    /** Lifetime of an OTP step-up challenge (CHALLENGE decision). */
+    FRAUD_STEP_UP_TTL_SECONDS: int(120, 30, 900),
+    /** Redis rolling-window cache entries (limit usage) expire after this long; the DB is the source of truth. */
+    LIMIT_WINDOW_CACHE_TTL_SECONDS: int(3600, 60, 86_400),
+    SANCTIONS_SCREENING_ENABLED: bool(true),
   })
   .superRefine((env, ctx) => {
     const db = new URL(env.DATABASE_URL);
@@ -120,6 +170,14 @@ export const envSchema = z
         path: ['DATABASE_URL'],
         message: 'transaction-pooler URLs (port 6543) must include ?pgbouncer=true',
       });
+    }
+    if (env.REDIS_MODE === 'memory') {
+      if (env.NODE_ENV === 'production') {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['REDIS_MODE'], message: 'memory mode is not allowed in production' });
+      }
+      if (env.QUEUE_DRIVER !== 'inline') {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['QUEUE_DRIVER'], message: 'must be inline when REDIS_MODE=memory' });
+      }
     }
     if (env.NODE_ENV === 'production' && !env.REDIS_URL.startsWith('rediss://')) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['REDIS_URL'], message: 'must use rediss:// (TLS) in production' });
@@ -136,11 +194,21 @@ export const envSchema = z
       if (env.BANK_SIM_ENABLED) {
         ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['BANK_SIM_ENABLED'], message: 'must be false in production' });
       }
-      for (const key of ['QR_SIGNING_SECRET', 'BANK_WEBHOOK_SECRET'] as const) {
+      if (env.CARD_SIM_ENABLED) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['CARD_SIM_ENABLED'], message: 'must be false in production' });
+      }
+      for (const key of ['QR_SIGNING_SECRET', 'BANK_WEBHOOK_SECRET', 'CARD_MASTER_KEY', 'CARD_FINGERPRINT_SECRET'] as const) {
         if (!env[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'is required in production' });
       }
       if (env.QUEUE_DRIVER !== 'bullmq') {
         ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['QUEUE_DRIVER'], message: 'must be bullmq in production' });
+      }
+    }
+    if (env.CARD_PREVIOUS_MASTER_KEYS) {
+      try {
+        parseMasterKeyList(env.CARD_PREVIOUS_MASTER_KEYS);
+      } catch (err) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['CARD_PREVIOUS_MASTER_KEYS'], message: (err as Error).message });
       }
     }
     if (env.QR_SIGNING_PREVIOUS_KEYS) {
@@ -156,10 +224,38 @@ export const envSchema = z
     // Development/test fallbacks only; production requires real secrets (checked above).
     QR_SIGNING_SECRET: env.QR_SIGNING_SECRET ?? DEV_ONLY_QR_SECRET,
     BANK_WEBHOOK_SECRET: env.BANK_WEBHOOK_SECRET ?? DEV_ONLY_WEBHOOK_SECRET,
+    CARD_MASTER_KEY: env.CARD_MASTER_KEY ?? DEV_ONLY_CARD_MASTER_KEY,
+    CARD_FINGERPRINT_SECRET: env.CARD_FINGERPRINT_SECRET ?? DEV_ONLY_CARD_FINGERPRINT_SECRET,
   }));
 
 const DEV_ONLY_QR_SECRET = 'dev-only-qr-signing-secret-do-not-use-in-production';
 const DEV_ONLY_WEBHOOK_SECRET = 'dev-only-bank-webhook-secret-do-not-use-in-production';
+/** base64("dev-only-card-master-key-32bytes"): development and tests only. */
+const DEV_ONLY_CARD_MASTER_KEY = 'ZGV2LW9ubHktY2FyZC1tYXN0ZXIta2V5LTMyYnl0ZXM=';
+const DEV_ONLY_CARD_FINGERPRINT_SECRET = 'dev-only-card-fingerprint-secret-do-not-use-in-production';
+
+/** true when `value` is standard base64 that decodes to exactly 32 bytes (an AES-256 key). */
+export function isBase64Key32(value: string): boolean {
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
+  return Buffer.from(value, 'base64').length === 32;
+}
+
+/** Parse "kid:base64key,kid2:base64key2" (decrypt-only master keys during rotation). */
+export function parseMasterKeyList(raw: string): Array<{ kid: string; key: string }> {
+  return raw
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const idx = part.indexOf(':');
+      const kid = part.slice(0, idx);
+      const key = part.slice(idx + 1);
+      if (idx <= 0 || !/^[A-Za-z0-9_-]{1,16}$/.test(kid) || !isBase64Key32(key)) {
+        throw new Error('entries must look like kid:base64key with a 32-byte base64 key');
+      }
+      return { kid, key };
+    });
+}
 
 /** Parse "kid:secret,kid2:secret2" (verify-only rotation keys). */
 export function parseKeyList(raw: string): Array<{ kid: string; secret: string }> {

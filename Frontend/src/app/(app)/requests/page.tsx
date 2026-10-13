@@ -1,7 +1,7 @@
 'use client';
 
 import * as React from 'react';
-import { useFormatter, useTranslations } from 'next-intl';
+import { useFormatter, useNow, useTranslations } from 'next-intl';
 import { useMutation } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { HandCoins } from 'lucide-react';
@@ -97,6 +97,8 @@ function RequestCard({
 }) {
   const t = useTranslations();
   const format = useFormatter();
+  // Consistent server/client time for relative dates; re-renders each minute.
+  const now = useNow({ updateInterval: 60_000 });
   const qc = useQueryClient();
   const other = direction === 'INCOMING' ? r.requester : r.payer;
   const act = useMutation({
@@ -118,7 +120,7 @@ function RequestCard({
                 : t('request.youAsked', { name: other.displayName, amount: formatMoney(r.amount) })}
             </p>
             {r.note ? <p className="text-sm text-fg-muted">“{r.note}”</p> : null}
-            <p className="text-xs text-fg-muted">{format.relativeTime(new Date(r.createdAt))}</p>
+            <p className="text-xs text-fg-muted">{format.relativeTime(new Date(r.createdAt), now)}</p>
           </div>
           <div className="flex flex-col items-end gap-2">
             <Amount money={r.amount} size="md" className="font-semibold" />

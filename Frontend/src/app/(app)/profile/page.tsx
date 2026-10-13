@@ -3,7 +3,7 @@
 import * as React from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useFormatter, useLocale, useTranslations } from 'next-intl';
+import { useFormatter, useLocale, useNow, useTranslations } from 'next-intl';
 import { useMutation } from '@tanstack/react-query';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -250,6 +250,8 @@ function ChangePinDialog({ open, onOpenChange }: { open: boolean; onOpenChange: 
 function SessionsCard() {
   const t = useTranslations();
   const format = useFormatter();
+  // Consistent server/client time for relative dates; re-renders each minute.
+  const now = useNow({ updateInterval: 60_000 });
   const qc = useQueryClient();
   const q = useSessions();
   const revoke = useMutation({
@@ -280,7 +282,7 @@ function SessionsCard() {
                         {s.current ? <Badge tone="accent">{t('profile.thisDevice')}</Badge> : null}
                       </p>
                       <p className="text-xs text-fg-muted">
-                        {t('profile.lastActive', { time: format.relativeTime(new Date(s.lastUsedAt)) })}
+                        {t('profile.lastActive', { time: format.relativeTime(new Date(s.lastUsedAt), now) })}
                         {s.ipAddress ? ` · ${s.ipAddress}` : ''}
                       </p>
                     </div>

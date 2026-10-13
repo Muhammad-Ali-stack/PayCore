@@ -74,6 +74,12 @@ describe('env validation', () => {
     );
   });
 
+  it('allows Redis-free memory mode only outside production and with the inline queue', () => {
+    expect(validateEnv({ ...base, REDIS_MODE: 'memory', QUEUE_DRIVER: 'inline' }).REDIS_MODE).toBe('memory');
+    expect(() => validateEnv({ ...base, REDIS_MODE: 'memory', QUEUE_DRIVER: 'bullmq' })).toThrow(/QUEUE_DRIVER/);
+    expect(() => validateEnv({ ...base, NODE_ENV: 'production', REDIS_MODE: 'memory', QUEUE_DRIVER: 'inline' })).toThrow(/REDIS_MODE/);
+  });
+
   it('requires TLS Redis in production', () => {
     // phase 2: production also requires the QR and bank-webhook secrets
     const prod = { ...base, NODE_ENV: 'production', QR_SIGNING_SECRET: 'q'.repeat(32), BANK_WEBHOOK_SECRET: 'w'.repeat(32) };

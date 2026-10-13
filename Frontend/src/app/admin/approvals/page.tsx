@@ -1,7 +1,7 @@
 'use client';
 
 import * as React from 'react';
-import { useFormatter, useTranslations } from 'next-intl';
+import { useFormatter, useNow, useTranslations } from 'next-intl';
 import { toast } from 'sonner';
 import { Check, Info, X } from 'lucide-react';
 import { PageHeader } from '@/components/layout/app-shell';
@@ -35,6 +35,8 @@ function ApprovalCard({
   const t = useTranslations();
   const dt = useDateTime();
   const format = useFormatter();
+  // Consistent server/client time for relative dates; re-renders each minute.
+  const now = useNow({ updateInterval: 60_000 });
   const own = Boolean(meId && meId === a.maker.id);
   const headingId = `appr-${a.id}`;
   const hintId = `appr-hint-${a.id}`;
@@ -72,7 +74,7 @@ function ApprovalCard({
           {a.status === 'PENDING' ? (
             <DetailRow label={t('admin.approvals.expires')}>
               <time dateTime={a.expiresAt} title={dt(a.expiresAt)}>
-                {format.relativeTime(new Date(a.expiresAt), new Date())}
+                {format.relativeTime(new Date(a.expiresAt), now)}
               </time>
             </DetailRow>
           ) : (

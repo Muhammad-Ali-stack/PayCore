@@ -1,5 +1,7 @@
 // @vitest-environment node
 /** i18n completeness: every English key exists in Urdu, with the same ICU placeholders. */
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import en from '../../messages/en.json';
 import ur from '../../messages/ur.json';
@@ -78,5 +80,48 @@ describe.each(catalogs)('%s messages', (_name, enCat, urCat) => {
     );
     // Allow a handful of brand/technical strings; anything more means a missed translation.
     expect(untranslated.length, untranslated.join(', ')).toBeLessThanOrEqual(12);
+  });
+});
+
+/**
+ * Regression: t.rich('key', { name: () => <El/> }) only works when the message uses a TAG
+ * (<name></name>). With a plain {name} placeholder next-intl inserts the function itself and
+ * React throws "Functions are not valid as a React child".
+ */
+describe('rich-text messages', () => {
+  const files: string[] = [];
+  const walk = (dir: string) => {
+    for (const name of readdirSync(dir)) {
+      const p = join(dir, name);
+      if (statSync(p).isDirectory()) walk(p);
+      else if (/\.tsx?$/.test(name)) files.push(p);
+    }
+  };
+  walk(join(__dirname, '..'));
+
+  const usages: Array<{ key: string; arg: string; file: string }> = [];
+  for (const file of files) {
+    const src = readFileSync(file, 'utf8');
+    for (const m of src.matchAll(/t\.rich\(\s*'([^']+)'\s*,\s*\{([^}]*)\}/g)) {
+      for (const a of m[2]!.matchAll(/([A-Za-z0-9_]+)\s*:\s*\(/g)) usages.push({ key: m[1]!, arg: a[1]!, file });
+    }
+  }
+  const all = [flatten(en as Tree), flatten(ur as Tree)];
+
+  it('finds the rich-text usages', () => {
+    expect(usages.length).toBeGreaterThan(0);
+  });
+
+  it('every function argument is a <tag> in both languages, never a {placeholder}', () => {
+    const bad: string[] = [];
+    for (const u of usages) {
+      for (const cat of all) {
+        const msgs = Object.entries(cat).filter(([k]) => k === u.key || k.endsWith(`.${u.key}`));
+        for (const [k, msg] of msgs) {
+          if (!msg.includes(`<${u.arg}>`) || msg.includes(`{${u.arg}}`)) bad.push(`${k} (${u.arg})`);
+        }
+      }
+    }
+    expect(bad).toEqual([]);
   });
 });

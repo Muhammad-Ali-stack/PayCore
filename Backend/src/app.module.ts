@@ -18,6 +18,7 @@ import { AppThrottlerGuard } from './common/throttling/throttling';
 import { FaultsModule } from './common/faults/fault-injector';
 import { QueueModule } from './common/queue/queue.module';
 import { ActivityModule } from './modules/activity/activity.module';
+import { AnalyticsModule } from './modules/analytics/analytics.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { FeesModule } from './modules/fees/fees.service';
 import { FundingModule } from './modules/funding/funding.module';
@@ -73,6 +74,7 @@ import { WalletsModule } from './modules/wallets/wallets.module';
     FundingModule,
     SettlementModule,
     ActivityModule,
+    AnalyticsModule,
     JobsModule,
   ],
   controllers: [HealthController],

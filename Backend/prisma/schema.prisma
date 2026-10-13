@@ -45,6 +45,8 @@ enum KycTier {
 enum OtpPurpose {
   REGISTRATION
   PASSWORD_RESET
+  /// Phase 3: fraud step-up (CHALLENGE decision) before a money movement is retried.
+  STEP_UP
 }
 
 enum KycSubmissionStatus {
@@ -94,6 +96,12 @@ enum EntryType {
   WITHDRAWAL_PAYOUT
   SETTLEMENT
   SETTLEMENT_PAYOUT
+  // phase 3
+  CARD_AUTH_HOLD
+  CARD_CAPTURE
+  CARD_HOLD_RELEASE
+  CARD_REFUND
+  BILL_PAYMENT
 }
 
 enum WalletStatus {
@@ -935,4 +943,546 @@ model SimBankStatementLine {
   @@index([valueDate])
   @@index([reference])
   @@map("sim_bank_statement_lines")
+}
+
+// ═══════════════════════════════ Phase 3 ═══════════════════════════════
+
+enum CardType {
+  VIRTUAL
+  SINGLE_USE
+}
+
+enum CardStatus {
+  ACTIVE
+  FROZEN
+  TERMINATED
+  USED
+}
+
+enum CardBrand {
+  VISA
+  MASTERCARD
+}
+
+enum CardAuthStatus {
+  AUTHORIZED
+  PARTIALLY_CAPTURED
+  CAPTURED
+  PARTIALLY_REFUNDED
+  REFUNDED
+  REVERSED
+  EXPIRED
+  DECLINED
+}
+
+enum CardEventKind {
+  CAPTURE
+  RELEASE
+  REFUND
+}
+
+enum CardChannel {
+  ECOMMERCE
+  POS
+}
+
+enum BillerCategory {
+  ELECTRICITY
+  GAS
+  WATER
+  INTERNET
+  MOBILE
+  TV
+  EDUCATION
+  GOVERNMENT
+}
+
+enum BillPaymentStatus {
+  PROCESSING
+  PAID
+  FAILED
+  REVERSED
+}
+
+enum BillAmountMode {
+  FULL_DUE
+  FIXED
+}
+
+enum BillFrequency {
+  ONCE
+  WEEKLY
+  MONTHLY
+}
+
+enum BillScheduleStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+}
+
+enum FraudAction {
+  ALLOW
+  CHALLENGE
+  BLOCK
+}
+
+enum FraudChannel {
+  P2P
+  QR
+  REQUEST
+  CARD
+  BILL
+}
+
+/// Declaration order is the sort order (CRITICAL first in the admin queue).
+enum FraudSeverity {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum FraudCaseStatus {
+  OPEN
+  INVESTIGATING
+  ESCALATED
+  CLOSED_FRAUD
+  CLOSED_LEGIT
+}
+
+enum StepUpStatus {
+  PENDING
+  PASSED
+  EXPIRED
+}
+
+enum FreezeReasonCode {
+  FRAUD_SUSPECTED
+  FRAUD_CONFIRMED
+  SANCTIONS_HIT
+  AML_REVIEW
+  COURT_ORDER
+  CUSTOMER_REQUEST
+  KYC_REVIEW
+  OTHER
+}
+
+enum AmlFlagType {
+  STRUCTURING
+  MULE_PATTERN
+  HIGH_VELOCITY
+  SANCTIONS_MATCH
+  FRAUD_BLOCK
+}
+
+enum AmlFlagStatus {
+  OPEN
+  CLEARED
+  ESCALATED
+}
+
+// ─────────────────────────────── Cards ───────────────────────────────
+
+/// A virtual card. The PAN and CVV are NEVER stored in plaintext: each card has its own random
+/// data key (AES-256-GCM) that encrypts them; the data key itself is encrypted ("wrapped") by the
+/// master key CARD_MASTER_KEY identified by `keyId` (envelope encryption, rotatable).
+model Card {
+  id                   String     @id @db.Uuid
+  userId               String     @map("user_id") @db.Uuid
+  walletId             String     @map("wallet_id") @db.Uuid
+  currency             Currency
+  type                 CardType
+  status               CardStatus @default(ACTIVE)
+  label                String
+  brand                CardBrand
+  last4                String
+  /// HMAC-SHA256(CARD_FINGERPRINT_SECRET, PAN): lookups by PAN without decrypting anything.
+  panFingerprint       String     @unique @map("pan_fingerprint")
+  /// Opaque network token used instead of the PAN between PayCore components.
+  token                String     @unique
+  panCiphertext        String     @map("pan_ciphertext")
+  cvvCiphertext        String     @map("cvv_ciphertext")
+  /// The per-card data key, wrapped by the master key `keyId`.
+  wrappedDataKey       String     @map("wrapped_data_key")
+  keyId                String     @map("key_id")
+  expiryMonth          Int        @map("expiry_month")
+  expiryYear           Int        @map("expiry_year")
+  cardholderName       String     @map("cardholder_name")
+  perTxnLimit          BigInt     @map("per_txn_limit")
+  dailyLimit           BigInt     @map("daily_limit")
+  monthlyLimit         BigInt     @map("monthly_limit")
+  ecommerceEnabled     Boolean    @default(true) @map("ecommerce_enabled")
+  internationalEnabled Boolean    @default(false) @map("international_enabled")
+  /// SINGLE_USE cards: optional cap on the one authorization.
+  amountCap            BigInt?    @map("amount_cap")
+  externalRef          String     @unique @map("external_ref")
+  requestHash          String     @map("request_hash")
+  usedAt               DateTime?  @map("used_at")
+  terminatedAt         DateTime?  @map("terminated_at")
+  timeline             Json       @default("[]")
+  createdAt            DateTime   @default(now()) @map("created_at")
+  updatedAt            DateTime   @updatedAt @map("updated_at")
+
+  authorizations CardAuthorization[]
+
+  @@index([userId, createdAt])
+  @@map("cards")
+}
+
+/// One card authorization from the card network and its lifecycle (hold -> capture -> refund,
+/// or hold -> reversal/expiry). The hold is a real ledger movement (wallet -> CARD_HOLDS).
+model CardAuthorization {
+  id               String         @id @default(uuid()) @db.Uuid
+  cardId           String         @map("card_id") @db.Uuid
+  userId           String         @map("user_id") @db.Uuid
+  walletId         String         @map("wallet_id") @db.Uuid
+  /// The network authorization message id: a redelivered message is answered from this row.
+  networkRef       String         @unique @map("network_ref")
+  merchantName     String         @map("merchant_name")
+  mcc              String
+  merchantCountry  String         @map("merchant_country")
+  channel          CardChannel
+  /// Card (wallet) currency amounts, minor units.
+  currency         Currency
+  amount           BigInt
+  capturedAmount   BigInt         @default(0) @map("captured_amount")
+  releasedAmount   BigInt         @default(0) @map("released_amount")
+  refundedAmount   BigInt         @default(0) @map("refunded_amount")
+  /// Cross-currency purchases: what the merchant charged, in its currency.
+  originalCurrency Currency?      @map("original_currency")
+  originalAmount   BigInt?        @map("original_amount")
+  status           CardAuthStatus
+  declineCode      String?        @map("decline_code")
+  declineReason    String?        @map("decline_reason")
+  holdEntryId      String?        @unique @map("hold_entry_id") @db.Uuid
+  fraudDecisionId  String?        @map("fraud_decision_id") @db.Uuid
+  expiresAt        DateTime?      @map("expires_at")
+  timeline         Json           @default("[]")
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+
+  card   Card            @relation(fields: [cardId], references: [id])
+  events CardAuthEvent[]
+
+  @@index([cardId, createdAt])
+  @@index([status, expiresAt])
+  @@map("card_authorizations")
+}
+
+/// Capture / release / refund messages applied to an authorization, each exactly once
+/// (network_ref UNIQUE) with its own journal entry.
+model CardAuthEvent {
+  id              String        @id @default(uuid()) @db.Uuid
+  authorizationId String        @map("authorization_id") @db.Uuid
+  kind            CardEventKind
+  amount          BigInt
+  networkRef      String        @unique @map("network_ref")
+  journalEntryId  String        @unique @map("journal_entry_id") @db.Uuid
+  reason          String?
+  createdAt       DateTime      @default(now()) @map("created_at")
+
+  authorization CardAuthorization @relation(fields: [authorizationId], references: [id])
+
+  @@index([authorizationId, createdAt])
+  @@map("card_auth_events")
+}
+
+/// Audit trail of PAN/CVV reveals (who, when, from where). The secrets themselves are never logged.
+model CardRevealLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  cardId    String   @map("card_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  sessionId String?  @map("session_id") @db.Uuid
+  ipAddress String?  @map("ip_address")
+  hideAt    DateTime @map("hide_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([cardId, createdAt])
+  @@map("card_reveal_logs")
+}
+
+// ─────────────────────────────── Bills ───────────────────────────────
+
+model Biller {
+  id                   String         @id @db.Uuid
+  code                 String         @unique
+  name                 String
+  shortName            String         @map("short_name")
+  category             BillerCategory
+  currency             Currency
+  country              String
+  referenceLabel       String         @map("reference_label")
+  referencePattern     String         @map("reference_pattern")
+  supportsInquiry      Boolean        @default(true) @map("supports_inquiry")
+  allowsPartialPayment Boolean        @default(false) @map("allows_partial_payment")
+  /// Convenience fee charged to the payer, minor units.
+  feeFixed             BigInt         @default(0) @map("fee_fixed")
+  active               Boolean        @default(true)
+  createdAt            DateTime       @default(now()) @map("created_at")
+
+  @@index([category])
+  @@map("billers")
+}
+
+/// A bill fetched from the biller (simulated adapter). Single use: paying claims it.
+model BillInquiry {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  billerId       String    @map("biller_id") @db.Uuid
+  reference      String
+  customerName   String    @map("customer_name")
+  billingMonth   String    @map("billing_month")
+  currency       Currency
+  amountDue      BigInt    @map("amount_due")
+  amountAfterDue BigInt?   @map("amount_after_due")
+  dueDate        DateTime  @map("due_date")
+  /// UNPAID | PAID | PARTIALLY_PAID (as reported by the biller)
+  billStatus     String    @map("bill_status")
+  fee            BigInt    @default(0)
+  expiresAt      DateTime  @map("expires_at")
+  consumedAt     DateTime? @map("consumed_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  @@index([userId, createdAt])
+  @@map("bill_inquiries")
+}
+
+model BillPayment {
+  id              String            @id @default(uuid()) @db.Uuid
+  userId          String            @map("user_id") @db.Uuid
+  walletId        String            @map("wallet_id") @db.Uuid
+  billerId        String            @map("biller_id") @db.Uuid
+  inquiryId       String?           @map("inquiry_id") @db.Uuid
+  scheduleId      String?           @map("schedule_id") @db.Uuid
+  reference       String
+  customerName    String            @map("customer_name")
+  billingMonth    String            @map("billing_month")
+  currency        Currency
+  amount          BigInt
+  fee             BigInt            @default(0)
+  status          BillPaymentStatus @default(PROCESSING)
+  receiptNumber   String?           @map("receipt_number")
+  failureCode     String?           @map("failure_code")
+  failureReason   String?           @map("failure_reason")
+  failureDetails  Json?             @map("failure_details")
+  /// Submissions to the biller (retried with backoff while PROCESSING).
+  attempts        Int               @default(0)
+  nextAttemptAt   DateTime?         @map("next_attempt_at")
+  /// Money moved: wallet -> BILLS_PAYABLE (+ fee). Reversed if the biller finally rejects it.
+  journalEntryId  String?           @unique @map("journal_entry_id") @db.Uuid
+  reversalEntryId String?           @unique @map("reversal_entry_id") @db.Uuid
+  fraudDecisionId String?           @map("fraud_decision_id") @db.Uuid
+  externalRef     String            @unique @map("external_ref")
+  requestHash     String            @map("request_hash")
+  timeline        Json              @default("[]")
+  createdAt       DateTime          @default(now()) @map("created_at")
+  updatedAt       DateTime          @updatedAt @map("updated_at")
+  paidAt          DateTime?         @map("paid_at")
+
+  @@index([userId, createdAt])
+  @@index([status, nextAttemptAt])
+  @@index([billerId, reference, billingMonth])
+  @@map("bill_payments")
+}
+
+model BillSchedule {
+  id            String             @id @default(uuid()) @db.Uuid
+  userId        String             @map("user_id") @db.Uuid
+  billerId      String             @map("biller_id") @db.Uuid
+  walletId      String             @map("wallet_id") @db.Uuid
+  reference     String
+  nickname      String?
+  amountMode    BillAmountMode     @map("amount_mode")
+  fixedAmount   BigInt?            @map("fixed_amount")
+  frequency     BillFrequency
+  /// Day of month the schedule was anchored on (MONTHLY keeps it, clamped to short months).
+  anchorDay     Int                @map("anchor_day")
+  nextRunAt     DateTime?          @map("next_run_at")
+  /// Retry number within the current cycle after a failed run (backoff); 0 = first attempt.
+  retryCount    Int                @default(0) @map("retry_count")
+  status        BillScheduleStatus @default(ACTIVE)
+  lastRunAt     DateTime?          @map("last_run_at")
+  lastRunStatus String?            @map("last_run_status")
+  lastPaymentId String?            @map("last_payment_id") @db.Uuid
+  externalRef   String             @unique @map("external_ref")
+  requestHash   String             @map("request_hash")
+  deletedAt     DateTime?          @map("deleted_at")
+  createdAt     DateTime           @default(now()) @map("created_at")
+  updatedAt     DateTime           @updatedAt @map("updated_at")
+
+  @@index([userId, createdAt])
+  @@index([status, nextRunAt])
+  @@map("bill_schedules")
+}
+
+/// What the SIMULATED biller has received (biller-side view: receipts per reference and month).
+model SimBillerPayment {
+  id            String   @id @default(uuid()) @db.Uuid
+  billerId      String   @map("biller_id") @db.Uuid
+  reference     String
+  billingMonth  String   @map("billing_month")
+  amount        BigInt
+  ourReference  String   @unique @map("our_reference")
+  receiptNumber String   @unique @map("receipt_number")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@index([billerId, reference, billingMonth])
+  @@map("sim_biller_payments")
+}
+
+// ─────────────────────────────── Fraud ───────────────────────────────
+
+/// A configurable rule of the synchronous fraud engine (thresholds in `params`).
+model FraudRule {
+  code        String        @id
+  name        String
+  description String
+  enabled     Boolean       @default(true)
+  /// Points added to the risk score when the rule fires (the score is capped at 100).
+  weight      Int
+  severity    FraudSeverity
+  params      Json          @default("{}")
+  updatedAt   DateTime      @default(now()) @updatedAt @map("updated_at")
+
+  @@map("fraud_rules")
+}
+
+/// Decision thresholds: score >= challenge => CHALLENGE (OTP step-up), >= block => BLOCK.
+model FraudPolicy {
+  id                 String   @id
+  challengeThreshold Int      @map("challenge_threshold")
+  blockThreshold     Int      @map("block_threshold")
+  updatedAt          DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("fraud_policies")
+}
+
+/// Every decision of the engine (ALLOW included), with its score and reasons.
+model FraudDecision {
+  id           String       @id @default(uuid()) @db.Uuid
+  userId       String       @map("user_id") @db.Uuid
+  channel      FraudChannel
+  action       FraudAction
+  score        Int
+  reasons      Json         @default("[]")
+  currency     Currency?
+  amount       BigInt?
+  /// The operation (payment external_ref, card network ref, ...).
+  subjectRef   String       @map("subject_ref")
+  stepUpPassed Boolean      @default(false) @map("step_up_passed")
+  ipAddress    String?      @map("ip_address")
+  deviceId     String?      @map("device_id")
+  createdAt    DateTime     @default(now()) @map("created_at")
+
+  @@index([userId, createdAt])
+  @@index([subjectRef])
+  @@map("fraud_decisions")
+}
+
+/// OTP step-up for a CHALLENGE decision, bound to the user and the operation (subject_ref).
+model StepUpChallenge {
+  id         String       @id @default(uuid()) @db.Uuid
+  userId     String       @map("user_id") @db.Uuid
+  decisionId String       @map("decision_id") @db.Uuid
+  subjectRef String       @map("subject_ref")
+  status     StepUpStatus @default(PENDING)
+  expiresAt  DateTime     @map("expires_at")
+  passedAt   DateTime?    @map("passed_at")
+  createdAt  DateTime     @default(now()) @map("created_at")
+
+  @@index([userId, subjectRef])
+  @@map("step_up_challenges")
+}
+
+model FraudCase {
+  id                String          @id @default(uuid()) @db.Uuid
+  userId            String          @map("user_id") @db.Uuid
+  severity          FraudSeverity
+  status            FraudCaseStatus @default(OPEN)
+  ruleCode          String          @map("rule_code")
+  score             Int
+  summary           String
+  currency          Currency?
+  amount            BigInt?
+  relatedPaymentIds Json            @default("[]") @map("related_payment_ids")
+  decisionId        String?         @unique @map("decision_id") @db.Uuid
+  assigneeId        String?         @map("assignee_id") @db.Uuid
+  resolvedAt        DateTime?       @map("resolved_at")
+  createdAt         DateTime        @default(now()) @map("created_at")
+  updatedAt         DateTime        @updatedAt @map("updated_at")
+
+  notes FraudCaseNote[]
+
+  @@index([status, severity, createdAt])
+  @@index([userId, createdAt])
+  @@map("fraud_cases")
+}
+
+model FraudCaseNote {
+  id         String   @id @default(uuid()) @db.Uuid
+  caseId     String   @map("case_id") @db.Uuid
+  authorId   String?  @map("author_id") @db.Uuid
+  authorName String   @map("author_name")
+  body       String
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  fraudCase FraudCase @relation(fields: [caseId], references: [id])
+
+  @@index([caseId, createdAt])
+  @@map("fraud_case_notes")
+}
+
+// ─────────────────────────── Limits & controls ───────────────────────────
+
+/// Account-level freeze with a reason code. While active, every money movement of the user is
+/// refused (ACCOUNT_FROZEN) and the user's wallets are FROZEN; lifting restores those wallets.
+model AccountFreeze {
+  id              String           @id @default(uuid()) @db.Uuid
+  userId          String           @map("user_id") @db.Uuid
+  reasonCode      FreezeReasonCode @map("reason_code")
+  note            String?
+  /// null = SYSTEM (sanctions screening, fraud engine)
+  actorId         String?          @map("actor_id") @db.Uuid
+  frozenWalletIds Json             @default("[]") @map("frozen_wallet_ids")
+  liftedAt        DateTime?        @map("lifted_at")
+  liftedById      String?          @map("lifted_by_id") @db.Uuid
+  liftNote        String?          @map("lift_note")
+  createdAt       DateTime         @default(now()) @map("created_at")
+
+  @@index([userId, createdAt])
+  @@map("account_freezes")
+}
+
+/// AML-style flags for compliance review (raised by the fraud engine and sanctions screening).
+model AmlFlag {
+  id           String        @id @default(uuid()) @db.Uuid
+  userId       String        @map("user_id") @db.Uuid
+  type         AmlFlagType
+  status       AmlFlagStatus @default(OPEN)
+  /// One flag per (user, type, UTC day): repeated hits don't flood the queue.
+  dedupeKey    String        @unique @map("dedupe_key")
+  details      Json          @default("{}")
+  subjectRef   String?       @map("subject_ref")
+  reviewedAt   DateTime?     @map("reviewed_at")
+  reviewedById String?       @map("reviewed_by_id") @db.Uuid
+  reviewNote   String?       @map("review_note")
+  createdAt    DateTime      @default(now()) @map("created_at")
+
+  @@index([status, createdAt])
+  @@index([userId, createdAt])
+  @@map("aml_flags")
+}
+
+/// MOCK sanctions list (fictional names) for the screening simulator.
+model SanctionsEntry {
+  id             String   @id @default(uuid()) @db.Uuid
+  listName       String   @map("list_name")
+  name           String
+  normalizedName String   @map("normalized_name")
+  country        String?
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([normalizedName])
+  @@map("sanctions_entries")
 }
